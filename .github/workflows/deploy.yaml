@@ -1,0 +1,311 @@
+name: Deploy
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Nunca dos despliegues en paralelo sobre el mismo state
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  K8S_NAMESPACE: web-app
+  K8S_DEPLOYMENT: web-app
+  K8S_INGRESS: web-app
+
+jobs:
+  # ──────────────────────────────────────────────
+  # JOB 1: Infraestructura (Terraform)
+  # ──────────────────────────────────────────────
+  infra:
+    name: Terraform
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: infra
+
+    outputs:
+      ecr_repository_url: ${{ steps.tf-output.outputs.ecr_repository_url }}
+      cluster_name: ${{ steps.tf-outputs.outputs.cluster_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      # El state vive en un bucket de la propia cuenta: ac2-tfstate-<account-id>
+      - name: Preparar bucket del state
+        id: backend
+        run: |
+          BUCKET="ac2-tfstate-$(aws sts get-caller-identity --query Account --output text)"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+          fi
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -input=false -backend-config="bucket=${{ steps.backend.outputs.bucket }}"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+
+      # Los jobs siguientes toman de aca los nombres reales (sin hardcodearlos)
+      - name: Exportar outputs
+        id: tf-outputs
+        run: |
+          echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
+          echo "cluster_name=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────
+  # JOB 2: Build y push a ECR
+  # ──────────────────────────────────────────────
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: infra
+
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag y push de imagen
+        id: build
+        env:
+          ECR_REPOSITORY_URL: ${{ needs.infra.outputs.ecr_repository_url }}
+        run: |
+          IMAGE_URI="$ECR_REPOSITORY_URL:${{ github.sha }}"
+
+          docker build \
+            --label "git.sha=${{ github.sha }}" \
+            --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$IMAGE_URI" \
+            ./app
+
+          docker push "$IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────
+  # JOB 3: Deploy en EKS
+  # ──────────────────────────────────────────────
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: [infra, build]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurar kubeconfig
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "${{ needs.infra.outputs.cluster_name }}"
+
+      - name: Aplicar manifiestos con la nueva imagen
+        env:
+          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
+          GITHUB_USER: ${{ github.actor }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          # Solo se sustituyen estas variables; el resto del YAML queda intacto
+          for f in k8s/*.yaml; do
+            envsubst "${IMAGE_URI} ${GITHUB_USER} ${GIT_SHA}" < "$f"
+            echo "---"
+          done | kubectl apply -f -
+
+      - name: Esperar el rollout
+        run: |
+          kubectl rollout status deployment/"$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=180s
+
+      - name: Mostrar estado
+        if: always()
+        run: |
+          kubectl get deploy,rs,pods,svc,endpoints,ingress -n "$K8S_NAMESPACE" -o wide
+          kubectl get events -n "$K8S_NAMESPACE" --sort-by=.lastTimestamp | tail -n 30
+
+  # ──────────────────────────────────────────────
+  # JOB 4: Validar la app a traves del ALB
+  # (NO MODIFICAR: es la validacion de la entrega)
+  # ──────────────────────────────────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    needs: [infra, deploy]
+
+    outputs:
+      alb_url: ${{ steps.alb.outputs.url }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configurar kubeconfig
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "${{ needs.infra.outputs.cluster_name }}"
+
+      - name: Obtener la URL del ALB
+        id: alb
+        run: |
+          for i in $(seq 1 30); do
+            HOST=$(kubectl get ingress "$K8S_INGRESS" -n "$K8S_NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "$HOST" ] && break
+            echo "[$i/30] El Ingress todavia no tiene ALB asignado..."
+            sleep 10
+          done
+          if [ -z "$HOST" ]; then
+            echo "::error::El Ingress no tiene ALB asignado. Revisar los eventos del Ingress."
+            exit 1
+          fi
+          echo "url=http://$HOST" >> "$GITHUB_OUTPUT"
+          echo "ALB: http://$HOST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Esperar a que el ALB responda /health
+        env:
+          ALB_URL: ${{ steps.alb.outputs.url }}
+        run: |
+          for i in $(seq 1 40); do
+            BODY=$(curl -s -m 5 "$ALB_URL/health" || true)
+            [ "$BODY" = "ok" ] && echo "/health -> ok" && exit 0
+            CODE=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$ALB_URL/health" || true)
+            echo "[$i/40] /health -> HTTP $CODE"
+            sleep 15
+          done
+          echo "::error::El ALB no responde 'ok' en /health"
+          exit 1
+
+      - name: Validar que la app corre en EKS detras del ALB
+        env:
+          ALB_URL: ${{ steps.alb.outputs.url }}
+        run: |
+          check() { # nombre, filtro jq
+            if echo "$JSON" | jq -e --arg user "$GITHUB_ACTOR" --arg sha "$GITHUB_SHA" "$2" >/dev/null; then
+              echo "  OK    $1"
+            else
+              echo "  FALLA $1"; FAILED=1
+            fi
+          }
+          # Reintenta: durante el rollout el ALB puede responder con pods viejos
+          for i in $(seq 1 20); do
+            JSON=$(curl -s -m 5 "$ALB_URL/?format=json" || echo '{}')
+            FAILED=0
+            echo "[$i/20] $JSON"
+            check "k8s_version es de EKS"         '.k8s_version | test("-eks-")'
+            check "provider_id es un EC2"         '.provider_id | startswith("aws:///")'
+            check "nodegroup informado"           '.nodegroup | length > 0'
+            check "instance_id informado"         '.instance_id | length > 0'
+            check "request paso por el ALB"       '.alb_trace_id | length > 0'
+            check "github_user = autor del push"  '.github_user == $user'
+            check "commit = commit desplegado"    '.commit == $sha'
+            [ "$FAILED" = 0 ] && exit 0
+            sleep 15
+          done
+          echo "::error::La respuesta de la app no cumple todas las validaciones"
+          exit 1
+
+      - name: Diagnostico
+        if: failure()
+        run: |
+          kubectl get deploy,pods,svc,endpoints,ingress -n "$K8S_NAMESPACE" -o wide || true
+          kubectl describe ingress "$K8S_INGRESS" -n "$K8S_NAMESPACE" || true
+          kubectl logs -n kube-system deployment/aws-load-balancer-controller --tail=30 || true
+
+  # ──────────────────────────────────────────────
+  # JOB 5: Evidencia de la entrega
+  # Se envia en cada ejecucion (aunque falle algun job): registra el intento.
+  # (NO MODIFICAR)
+  # ──────────────────────────────────────────────
+  evidence:
+    name: Publish evidence
+    runs-on: ubuntu-latest
+    needs: [infra, build, deploy, validate]
+    if: ${{ !cancelled() }}
+
+    steps:
+      - name: Publish evidence
+        run: |
+          cat > evidence.json <<EOF
+          {
+            "actor": "${{ github.actor }}",
+            "repository": "${{ github.repository }}",
+            "sha": "${{ github.sha }}",
+            "image": "${{ needs.build.outputs.image_uri }}",
+            "alb_url": "${{ needs.validate.outputs.alb_url }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "results": {
+              "infra": "${{ needs.infra.result }}",
+              "build": "${{ needs.build.result }}",
+              "deploy": "${{ needs.deploy.result }}",
+              "validate": "${{ needs.validate.result }}"
+            },
+            "date": "$(date -u +%FT%TZ)"
+          }
+          EOF
+          cat evidence.json
+          RESP=$(curl -sS --fail-with-body -X PUT --upload-file evidence.json \
+            -H "Content-Type: application/json" \
+            "${{ vars.EVIDENCE_URL }}/${{ github.actor }}.json") || { echo "::error::El receptor rechazo la evidencia: $RESP"; exit 1; }
+          echo "Respuesta del receptor:"
+          echo "$RESP" | jq . || echo "$RESP"
+          {
+            echo "### Evidencia registrada"
+            echo "- URL del ALB: ${{ needs.validate.outputs.alb_url || '(sin ALB todavia)' }}"
+            echo "- $(echo "$RESP" | jq -r '"Intento #\(.intento): \(.mensaje)"' 2>/dev/null)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: web-app
+  name: web-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-app
+    spec:
+      serviceAccountName: web-app
+      containers:
+        - name: web-app
+          # El pipeline reemplaza ${IMAGE_URI} por <ecr>/web-app:<git-sha>
+          image: ${IMAGE_URI}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          # Downward API: la app muestra el pod y consulta su nodo en la API
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            # Evidencia de la entrega: el pipeline reemplaza estas variables
+            - name: GITHUB_USER
+              value: "${GITHUB_USER}"
+            - name: GIT_SHA
+              value: "${GIT_SHA}"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
